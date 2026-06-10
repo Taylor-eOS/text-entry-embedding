@@ -100,17 +100,10 @@ def simulate(stream, alphabet, reorder_fn, context_len):
     avg = total_cost / total_chars if total_chars else 0.0
     return total_cost, total_chars, avg
 
-def ctx_to_id(ctx, char_to_idx, base, context_len):
-    out = 0
-    for ch in ctx:
-        out = out * base + char_to_idx[ch]
-    return out
-
 def make_examples(stream, context_len, char_to_idx):
     padded = [SENTINEL] * context_len + stream
     x = []
     y = []
-    base = len(char_to_idx)
     for i in range(context_len, len(padded)):
         tgt = padded[i]
         if tgt not in char_to_idx:
@@ -118,7 +111,7 @@ def make_examples(stream, context_len, char_to_idx):
         ctx = padded[i - context_len:i]
         if any(ch not in char_to_idx for ch in ctx):
             continue
-        x.append(ctx_to_id(ctx, char_to_idx, base, context_len))
+        x.append([char_to_idx[ch] for ch in ctx])
         y.append(char_to_idx[tgt])
     if not x:
         raise ValueError("No training examples were created from the input text.")
@@ -135,23 +128,23 @@ def split_examples(x, y, val_fraction, seed):
     return x[train_idx], y[train_idx], x[val_idx], y[val_idx]
 
 class ContextFactorModel(nn.Module):
-    def __init__(self, num_contexts, dim, vocab_size, sentinel_idx):
+    def __init__(self, vocab_size, dim, sentinel_idx, context_len):
         super().__init__()
         self.sentinel_idx = sentinel_idx
-        self.context_emb = nn.Embedding(num_contexts, dim)
+        self.context_len = context_len
+        self.slot_embs = nn.ModuleList([nn.Embedding(vocab_size, dim) for _ in range(context_len)])
         self.char_emb = nn.Embedding(vocab_size, dim)
         self.char_bias = nn.Parameter(torch.zeros(vocab_size))
-    def forward(self, context_ids):
-        if context_ids.dim() == 0:
-            context_ids = context_ids.unsqueeze(0)
-        ctx_vec = self.context_emb(context_ids)
-        logits = ctx_vec @ self.char_emb.weight.t()
-        logits = logits + self.char_bias
+    def forward(self, context_idxs):
+        ctx_vec = 0
+        for i in range(self.context_len):
+            ctx_vec = ctx_vec + self.slot_embs[i](context_idxs[:, i])
+        logits = ctx_vec @ self.char_emb.weight.t() + self.char_bias
         logits[:, self.sentinel_idx] = -1e9
         return logits
-    def predict_ordering(self, context_id, idx_to_char):
+    def predict_ordering(self, context_idxs, idx_to_char):
         device = next(self.parameters()).device
-        x = torch.tensor([int(context_id)], dtype=torch.long, device=device)
+        x = torch.tensor(context_idxs, dtype=torch.long, device=device).unsqueeze(0)
         with torch.no_grad():
             logits = self.forward(x).squeeze(0)
             order = torch.argsort(logits, descending=True).tolist()
@@ -159,7 +152,7 @@ class ContextFactorModel(nn.Module):
     def parameter_bytes(self):
         return sum(p.numel() for p in self.parameters()) * 4
     def runtime_bytes(self):
-        return self.context_emb.embedding_dim * 4
+        return sum(p.numel() for p in self.parameters()) * 4
 
 def evaluate_loss(model, x, y, batch_size):
     model.eval()
@@ -243,8 +236,6 @@ def main():
     alphabet, char_to_idx, idx_to_char = build_vocab(stream)
     if len(alphabet) <= 2:
         raise ValueError("The input text does not contain enough characters after normalization.")
-    base = len(alphabet)
-    num_contexts = base ** context_len
     all_x, all_y = make_examples(stream, context_len, char_to_idx)
     train_x, train_y, val_x, val_y = split_examples(all_x, all_y, val_fraction, seed)
     global_order = build_global_freq(stream, alphabet)
@@ -257,21 +248,20 @@ def main():
     print(f"Alphabet:            {''.join(global_order)}")
     print(f"Alphabet size:       {len(alphabet) - 1}")
     print(f"Context length:      {context_len}")
-    print(f"Contexts possible:   {num_contexts}")
     print(f"Dim:                 {dim}")
     print(f"Train examples:      {len(train_x)}")
     print(f"Validation examples: {len(val_x)}")
     print(f"Static baseline:     {static_avg:.4f} rotations/char")
     print(f"Oracle {context_len}-gram:       {oracle_avg:.4f} rotations/char")
-    model = ContextFactorModel(num_contexts, dim, len(alphabet), char_to_idx[SENTINEL]).to(device)
+    model = ContextFactorModel(len(alphabet), dim, char_to_idx[SENTINEL], context_len).to(device)
     model = train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed)
     cost, chars, avg = evaluate_rotations(model, val_x, val_y, idx_to_char, char_to_idx, batch_size)
     print(f"\nVal rotations/char:  {avg:.4f}  (vs static {static_avg - avg:+.4f}, vs oracle {oracle_avg - avg:+.4f})")
     print(f"Flash bytes:         {model.parameter_bytes()}")
     print(f"Runtime bytes:       {model.runtime_bytes()}")
     sample_ctx = [idx_to_char[i.item()] for i in val_x[0]]
-    sample_id = int(val_x[0].item())
-    ordering = model.predict_ordering(sample_id, idx_to_char)
+    sample_idxs = val_x[0].tolist()
+    ordering = model.predict_ordering(sample_idxs, idx_to_char)
     print(f"\nSample context: {''.join(sample_ctx)}")
     print(f"Predictions: {''.join(ordering)}")
 
